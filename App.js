@@ -58,6 +58,12 @@ const App = () => {
   const [isTyping, setIsTyping] = useState(false);
   const [destructingMessages, setDestructingMessages] = useState(new Set());
 
+// Add these new states after your existing state declarations
+const [openDropdown, setOpenDropdown] = useState(null);
+const [pendingDecryption, setPendingDecryption] = useState({});
+const [decryptionInputs, setDecryptionInputs] = useState({});
+const [isDecrypting, setIsDecrypting] = useState({});
+
  // Initialize socket connection
 useEffect(() => {
   if (token && !socket) {
@@ -124,6 +130,50 @@ useEffect(() => {
     newSocket.on('error', (error) => {
       toast.error(error.message);
     });
+
+// Add these new listeners before the return statement in the socket useEffect
+
+      newSocket.on('message_seen_update', (data) => {
+        const { message_id } = data;
+        setMessages(prev => prev.map(msg => 
+          msg.id === message_id 
+            ? { ...msg, is_seen: true }
+            : msg
+        ));
+      });
+
+      newSocket.on('inline_decryption_request', (data) => {
+        const { message_id, requester_username } = data;
+        setPendingDecryption(prev => ({ ...prev, [message_id]: true }));
+        toast(`🔓 ${requester_username} wants to decrypt your message`, {
+          duration: 5000,
+          icon: '🔑'
+        });
+      });
+
+      newSocket.on('start_decryption_animation', (data) => {
+        const { message_id, decoy_content, real_content, self_destruct_timer } = data;
+        
+        // Start the epic decryption animation
+        startDecryptionAnimation(message_id, decoy_content, real_content, self_destruct_timer);
+        
+        // Clear pending decryption state
+        setPendingDecryption(prev => {
+          const newState = { ...prev };
+          delete newState[message_id];
+          return newState;
+        });
+      });
+
+      newSocket.on('inline_decryption_denied', (data) => {
+        toast.error('❌ Decryption request denied');
+      });
+
+      newSocket.on('message_deleted', (data) => {
+        const { message_id } = data;
+        setMessages(prev => prev.filter(msg => msg.id !== message_id));
+        toast.success('🗑️ Message deleted');
+      });
 
     return () => {
       newSocket.close();
@@ -359,6 +409,288 @@ const addContact = async (contactId, nickname) => {
       }
     }
   };
+
+// Dropdown management
+const toggleMessageDropdown = (messageId) => {
+  setOpenDropdown(openDropdown === messageId ? null : messageId);
+};
+
+// Format countdown timer
+const formatCountdown = (seconds) => {
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
+};
+
+// Handle inline decryption request
+const handleInlineDecryptionRequest = (messageId) => {
+  setPendingDecryption(prev => ({ ...prev, [messageId]: true }));
+  setOpenDropdown(null);
+  
+  // Find message and emit request
+  const message = messages.find(m => m.id === messageId);
+  if (socket && message) {
+    socket.emit('inline_decryption_request', { 
+      message_id: messageId,
+      sender_id: message.sender_id
+    });
+  }
+  
+  toast.success('🔓 Decryption request sent');
+};
+
+// Handle decryption input
+const handleDecryptionInput = (messageId, value) => {
+  setDecryptionInputs(prev => ({ ...prev, [messageId]: value }));
+};
+
+// Provide inline decryption key
+const handleProvideInlineKey = (messageId) => {
+  const key = decryptionInputs[messageId];
+  if (!key || !socket) return;
+  
+  setIsDecrypting(prev => ({ ...prev, [messageId]: true }));
+  
+  socket.emit('provide_inline_decryption', {
+    message_id: messageId,
+    decryption_key: key,
+    approve: true
+  });
+};
+
+// Deny inline decryption
+const handleDenyInlineDecryption = (messageId) => {
+  setPendingDecryption(prev => {
+    const newState = { ...prev };
+    delete newState[messageId];
+    return newState;
+  });
+  
+  setDecryptionInputs(prev => {
+    const newState = { ...prev };
+    delete newState[messageId];
+    return newState;
+  });
+  
+  if (socket) {
+    socket.emit('provide_inline_decryption', {
+      message_id: messageId,
+      approve: false
+    });
+  }
+  
+  toast.error('❌ Decryption denied');
+};
+
+// Delete message
+const handleDeleteMessage = (messageId) => {
+  if (socket) {
+    socket.emit('delete_message', { message_id: messageId });
+  }
+  setOpenDropdown(null);
+};
+
+// Epic decryption animation function
+const startDecryptionAnimation = async (messageId, decoyContent, realContent, selfDestructTimer) => {
+  setIsDecrypting(prev => ({ ...prev, [messageId]: true }));
+  
+  // Play crackling sound
+  playCracklingSound();
+  
+  // Phase 1: Red glow + character morphing
+  const messageElement = document.querySelector(`[data-message-id="${messageId}"] .decoy-text`);
+  if (!messageElement) return;
+  
+  messageElement.classList.add('decrypting');
+  
+  // Character transformation logic
+  const decoyChars = decoyContent.split('');
+  const realChars = realContent.split('');
+  const maxLength = Math.max(decoyChars.length, realChars.length);
+  
+  // Pad shorter string with spaces
+  while (decoyChars.length < maxLength) decoyChars.push(' ');
+  while (realChars.length < maxLength) realChars.push(' ');
+  
+  let currentText = decoyChars.slice();
+  let transformedCount = 0;
+  
+  // Random transformation pattern
+  const transformOrder = Array.from({ length: maxLength }, (_, i) => i)
+    .sort(() => Math.random() - 0.5);
+  
+  // Transform characters one by one
+  const transformInterval = setInterval(() => {
+    if (transformedCount >= maxLength) {
+      clearInterval(transformInterval);
+      completeDecryption(messageId, realContent, selfDestructTimer);
+      return;
+    }
+    
+    // Transform next batch of characters (2-4 at a time for dramatic effect)
+    const batchSize = Math.min(Math.floor(Math.random() * 3) + 2, maxLength - transformedCount);
+    
+    for (let i = 0; i < batchSize && transformedCount < maxLength; i++) {
+      const index = transformOrder[transformedCount];
+      currentText[index] = realChars[index];
+      transformedCount++;
+    }
+    
+    // Update display
+    messageElement.textContent = currentText.join('');
+    
+  }, 50); // 50ms intervals for smooth animation
+};
+
+// Complete decryption with green glow and shimmer
+const completeDecryption = (messageId, realContent, selfDestructTimer) => {
+  // Stop crackling sound
+  stopCracklingSound();
+  
+  // Play completion chime
+  playCompletionChime();
+  
+  const messageElement = document.querySelector(`[data-message-id="${messageId}"] .decoy-text`);
+  if (!messageElement) return;
+  
+  // Remove red glow, add green glow
+  messageElement.classList.remove('decrypting');
+  messageElement.classList.add('decrypted-success');
+  
+  // Add shimmer effect
+  messageElement.parentElement.classList.add('shimmer-pass');
+  
+  // Update message state
+  setMessages(prev => prev.map(msg => 
+    msg.id === messageId 
+      ? { 
+          ...msg, 
+          content: realContent,
+          is_encrypted_display: false,
+          is_decrypted: true 
+        }
+      : msg
+  ));
+  
+  // Remove effects after 3 seconds
+  setTimeout(() => {
+    messageElement.classList.remove('decrypted-success');
+    messageElement.parentElement.classList.remove('shimmer-pass');
+    
+    setIsDecrypting(prev => {
+      const newState = { ...prev };
+      delete newState[messageId];
+      return newState;
+    });
+    
+    // Start self-destruct countdown
+    startSelfDestructCountdown(messageId, selfDestructTimer);
+    
+  }, 3000);
+};
+
+// Self-destruct countdown
+const startSelfDestructCountdown = (messageId, initialTimer) => {
+  let timeLeft = initialTimer;
+  
+  const countdownInterval = setInterval(() => {
+    timeLeft--;
+    
+    // Update countdown display
+    setMessages(prev => prev.map(msg => 
+      msg.id === messageId 
+        ? { ...msg, self_destruct_timer: timeLeft }
+        : msg
+    ));
+    
+    if (timeLeft <= 0) {
+      clearInterval(countdownInterval);
+      
+      // Start destruction animation
+      setDestructingMessages(prev => new Set(prev).add(messageId));
+      
+      setTimeout(() => {
+        setMessages(prev => prev.filter(msg => msg.id !== messageId));
+        setDestructingMessages(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(messageId);
+          return newSet;
+        });
+        
+        // Notify server
+        if (socket) {
+          socket.emit('message_self_destructed', { message_id: messageId });
+        }
+      }, 2000);
+    }
+  }, 1000);
+};
+
+// Message seen tracking
+const markMessageAsSeen = (messageId) => {
+  if (socket) {
+    socket.emit('message_seen', { message_id: messageId });
+  }
+};
+
+// Sound effect functions with Web Audio API
+const [audioContext, setAudioContext] = useState(null);
+const [cracklingSound, setCracklingSound] = useState(null);
+
+const playCracklingSound = () => {
+  if (!audioContext) {
+    const context = new (window.AudioContext || window.webkitAudioContext)();
+    setAudioContext(context);
+    
+    // Generate matrix-style crackling noise
+    const buffer = context.createBuffer(1, context.sampleRate * 2, context.sampleRate);
+    const data = buffer.getChannelData(0);
+    
+    for (let i = 0; i < data.length; i++) {
+      data[i] = (Math.random() * 2 - 1) * 0.3 * Math.sin(i * 0.01);
+    }
+    
+    const source = context.createBufferSource();
+    const gainNode = context.createGain();
+    
+    source.buffer = buffer;
+    source.loop = true;
+    gainNode.gain.setValueAtTime(0.1, context.currentTime);
+    
+    source.connect(gainNode);
+    gainNode.connect(context.destination);
+    source.start();
+    
+    setCracklingSound(source);
+  }
+};
+
+const stopCracklingSound = () => {
+  if (cracklingSound) {
+    cracklingSound.stop();
+    setCracklingSound(null);
+  }
+};
+
+const playCompletionChime = () => {
+  if (audioContext) {
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    
+    oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
+    oscillator.frequency.exponentialRampToValueAtTime(1200, audioContext.currentTime + 0.1);
+    oscillator.frequency.exponentialRampToValueAtTime(600, audioContext.currentTime + 0.3);
+    
+    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+    
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    
+    oscillator.start();
+    oscillator.stop(audioContext.currentTime + 0.5);
+  }
+};
 
   // Load initial data
  useEffect(() => {
@@ -726,6 +1058,7 @@ useEffect(() => {
                 {messages.map((message) => (
                   <motion.div
                     key={message.id}
+		data-message-id={message.id}
                     initial={{ opacity: 0, y: 20 }}
                     animate={{ 
                       opacity: destructingMessages.has(message.id) ? 0 : 1,
@@ -733,31 +1066,96 @@ useEffect(() => {
                     }}
                     exit={{ opacity: 0, scale: 0.8 }}
                     className={`message ${message.sender_id === currentUser?.id ? 'sent' : 'received'}`}
+			onViewportEnter={() => {
+      // Mark as seen when message enters viewport
+      if (message.sender_id !== currentUser?.id && !message.is_seen) {
+        markMessageAsSeen(message.id);
+      }
+    }}
                   >
                     <div className="message-content">
-                      {message.content === '[ENCRYPTED - Double-click to request decryption]' ? (
-                        <div 
-                          className="encrypted-message"
-                          onDoubleClick={() => handleRequestDecryption(message.id)}
-                        >
-                          <Lock size={16} />
-                          <span>🔒 Encrypted Message - Double-click to decrypt</span>
-                          <small>Hint: {message.sender_key_hint}</small>
-                        </div>
-                      ) : (
-                        <div className="decrypted-message">
-                          <Unlock size={16} />
-                          <span>{message.content}</span>
-                          <div className="destruction-timer">
-                            <Timer size={12} />
-                            Self-destructs in {message.self_destruct_timer}s
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                    <div className="message-time">
-                      {new Date(message.created_at).toLocaleTimeString()}
-                    </div>
+  <div className="message-text">
+    {message.is_encrypted_display ? (
+      <div className="encrypted-message">
+        <Lock size={16} />
+        <span className="decoy-text">{message.decoy_content || message.content}</span>
+        <small>Hint: {message.sender_key_hint}</small>
+      </div>
+    ) : (
+      <div className="decrypted-message">
+        <Unlock size={16} />
+        <span className="actual-message">{message.content}</span>
+        <div className="destruction-timer">
+          <Timer size={12} />
+          Self-destructs in {formatCountdown(message.self_destruct_timer)}
+        </div>
+      </div>
+    )}
+  </div>
+  
+  {/* Message Dropdown */}
+  <div className="message-dropdown">
+    <button 
+      className="dropdown-trigger"
+      onClick={() => toggleMessageDropdown(message.id)}
+    >
+      ⋯
+    </button>
+    
+    {openDropdown === message.id && (
+      <div className="dropdown-menu">
+        {message.sender_id !== currentUser?.id && message.is_encrypted_display && (
+          <button 
+            onClick={() => handleInlineDecryptionRequest(message.id)}
+            className="dropdown-item"
+          >
+            Request decryption key
+          </button>
+        )}
+        <button 
+          onClick={() => handleDeleteMessage(message.id)}
+          className="dropdown-item delete-item"
+        >
+          Delete Message
+        </button>
+      </div>
+    )}
+  </div>
+</div>
+
+{/* Inline Decryption Request */}
+{pendingDecryption[message.id] && (
+  <div className="inline-decryption-request">
+    <input
+      type="password"
+      placeholder="Enter decryption key..."
+      value={decryptionInputs[message.id] || ''}
+      onChange={(e) => handleDecryptionInput(message.id, e.target.value)}
+      onKeyPress={(e) => e.key === 'Enter' && handleProvideInlineKey(message.id)}
+      className="decryption-input"
+    />
+    <button 
+      onClick={() => handleProvideInlineKey(message.id)}
+      className="approve-btn"
+    >
+      Decrypt
+    </button>
+    <button 
+      onClick={() => handleDenyInlineDecryption(message.id)}
+      className="deny-btn"
+    >
+      Deny
+    </button>
+  </div>
+)}
+                  <div className="message-time">
+  {message.sender_id === currentUser?.id && (
+    <span className={`message-status ${message.is_seen ? 'received' : 'sent'}`}>
+      {message.is_seen ? 'Received:' : 'Sent:'}
+    </span>
+  )}
+  {new Date(message.created_at).toLocaleTimeString()}
+</div>
                   </motion.div>
                 ))}
               </AnimatePresence>
