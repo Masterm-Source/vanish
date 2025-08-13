@@ -27,6 +27,33 @@ const decryptMessage = (encryptedContent, senderKey) => {
   }
 };
 
+// Generate fake base64 decoy content
+const generateDecoy = (originalMessageLength) => {
+  // Create realistic decoy length (1.3x to 1.8x original length)
+  const multiplier = 1.3 + (Math.random() * 0.5);
+  const targetLength = Math.ceil(originalMessageLength * multiplier);
+  
+  // Generate random bytes and convert to base64
+  const randomBytes = crypto.randomBytes(targetLength);
+  let decoy = randomBytes.toString('base64');
+  
+  // Add some realistic-looking structure occasionally
+  if (Math.random() > 0.5) {
+    // Insert some dots, equals signs, and slashes to make it look more authentic
+    const insertions = ['...', '==', '//', '::'];
+    const randomInsertion = insertions[Math.floor(Math.random() * insertions.length)];
+    const insertPosition = Math.floor(decoy.length * Math.random());
+    decoy = decoy.slice(0, insertPosition) + randomInsertion + decoy.slice(insertPosition);
+  }
+  
+  // Ensure minimum length for very short messages
+  if (decoy.length < 50) {
+    decoy += crypto.randomBytes(30).toString('base64');
+  }
+  
+  return decoy;
+};
+
 // Initialize Socket.IO with revolutionary features
 const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
   
@@ -61,7 +88,8 @@ const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
       }
     });
 
-    // Handle new message sending
+    // REPLACE your entire send_message handler (around lines 75-130) with this:
+
     socket.on('send_message', async (data) => {
       try {
         const { conversation_id, content, sender_key, key_hint, message_type = 'text' } = data;
@@ -89,19 +117,23 @@ const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
         
         const encryptedContent = `${encrypted}:${iv.toString('hex')}`;
 
+        // Generate decoy content
+        const decoyContent = generateDecoy(content.length);
+
         // Calculate self-destruction time
         const destructionTimer = content.length <= 50 ? 60 : 
                                content.length <= 200 ? 120 : 
                                content.length <= 500 ? 180 : 240;
 
-        // Store message
+        // Store message with decoy
         const result = await pool.query(`
           INSERT INTO messages (
             conversation_id, sender_id, content, message_type, 
-            sender_key_hint, self_destruct_timer, created_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, NOW()) 
+            sender_key_hint, self_destruct_timer, decoy_content, 
+            is_encrypted_display, is_seen, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) 
           RETURNING *
-        `, [conversation_id, senderId, encryptedContent, message_type, key_hint, destructionTimer]);
+        `, [conversation_id, senderId, encryptedContent, message_type, key_hint, destructionTimer, decoyContent, true, false]);
 
         const message = result.rows[0];
 
@@ -120,21 +152,23 @@ const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
           sender_photo: socket.user.profile_photo,
           message_type: message.message_type,
           sender_key_hint: message.sender_key_hint,
+          is_encrypted_display: true,
           is_decrypted: false,
+          is_seen: false,
           self_destruct_timer: message.self_destruct_timer,
           created_at: message.created_at,
-          content: '[ENCRYPTED - Double-click to request decryption]'
+          content: decoyContent,  // Show decoy to everyone initially
+          decoy_content: decoyContent
         };
 
         io.to(`conversation_${conversation_id}`).emit('new_message', messageData);
-        console.log(`💬 Message sent in conversation ${conversation_id}`);
+        console.log(`💬 Message sent in conversation ${conversation_id} with decoy`);
 
       } catch (error) {
         console.error('Send message error:', error);
         socket.emit('error', { message: 'Failed to send message' });
       }
     });
-
     // Handle decryption request (revolutionary feature)
     socket.on('request_decryption', async (data) => {
       try {
@@ -272,6 +306,177 @@ const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
           message: error.message.includes('Invalid decryption key') ? 
                    'Invalid decryption key' : 'Failed to decrypt message' 
         });
+      }
+    });
+
+    // Handle message seen (read receipt)
+    socket.on('message_seen', async (data) => {
+      try {
+        const { message_id } = data;
+        const viewerId = socket.user.id;
+
+        // Update message as seen
+        const result = await pool.query(
+          'UPDATE messages SET is_seen = true WHERE id = $1 AND sender_id != $2 RETURNING sender_id',
+          [message_id, viewerId]
+        );
+
+        if (result.rows.length > 0) {
+          const senderId = result.rows[0].sender_id;
+          
+          // Notify sender that message was seen
+          io.to(`user_${senderId}`).emit('message_seen_update', {
+            message_id: message_id,
+            seen_by: socket.user.username,
+            seen_at: new Date()
+          });
+
+          console.log(`👀 Message ${message_id} seen by ${socket.user.username}`);
+        }
+
+      } catch (error) {
+        console.error('Message seen error:', error);
+      }
+    });
+
+    // Handle inline decryption request
+    socket.on('inline_decryption_request', async (data) => {
+      try {
+        const { message_id, sender_id } = data;
+        const requesterId = socket.user.id;
+
+        // Get message details
+        const messageResult = await pool.query(
+          'SELECT * FROM messages WHERE id = $1',
+          [message_id]
+        );
+
+        if (messageResult.rows.length === 0) {
+          socket.emit('error', { message: 'Message not found' });
+          return;
+        }
+
+        const message = messageResult.rows[0];
+
+        // Don't allow sender to request their own message
+        if (message.sender_id === requesterId) {
+          socket.emit('error', { message: 'Cannot request decryption of your own message' });
+          return;
+        }
+
+        // Notify sender about inline decryption request
+        io.to(`user_${sender_id}`).emit('inline_decryption_request', {
+          message_id: message_id,
+          requester_username: socket.user.username,
+          requester_id: requesterId,
+          key_hint: message.sender_key_hint
+        });
+
+        console.log(`🔓 Inline decryption requested for message ${message_id}`);
+
+      } catch (error) {
+        console.error('Inline decryption request error:', error);
+        socket.emit('error', { message: 'Failed to request decryption' });
+      }
+    });
+
+    // Handle inline decryption key provision
+    socket.on('provide_inline_decryption', async (data) => {
+      try {
+        const { message_id, decryption_key, approve = true } = data;
+        const senderId = socket.user.id;
+
+        // Get message
+        const messageResult = await pool.query(
+          'SELECT * FROM messages WHERE id = $1 AND sender_id = $2',
+          [message_id, senderId]
+        );
+
+        if (messageResult.rows.length === 0) {
+          socket.emit('error', { message: 'Message not found or not authorized' });
+          return;
+        }
+
+        const message = messageResult.rows[0];
+
+        if (!approve) {
+          // Deny decryption request
+          io.to(`conversation_${message.conversation_id}`).emit('inline_decryption_denied', {
+            message_id: message_id,
+            message: 'Sender denied decryption request'
+          });
+
+          socket.emit('decryption_response_sent', { message: 'Decryption request denied' });
+          return;
+        }
+
+        // Try to decrypt with provided key
+        const decryptedContent = decryptMessage(message.content, decryption_key);
+
+        // Update message as decrypted
+        await pool.query(
+          'UPDATE messages SET is_decrypted = true, is_encrypted_display = false WHERE id = $1',
+          [message_id]
+        );
+
+        // Emit decryption animation to all conversation participants
+        io.to(`conversation_${message.conversation_id}`).emit('start_decryption_animation', {
+          message_id: message_id,
+          decoy_content: message.decoy_content,
+          real_content: decryptedContent,
+          self_destruct_timer: message.self_destruct_timer
+        });
+
+        console.log(`🔑 Message ${message_id} decrypted inline successfully`);
+
+      } catch (error) {
+        console.error('Provide inline decryption error:', error);
+        socket.emit('error', { 
+          message: error.message.includes('Invalid decryption key') ? 
+                   'Invalid decryption key' : 'Failed to decrypt message' 
+        });
+      }
+    });
+
+    // Handle delete message
+    socket.on('delete_message', async (data) => {
+      try {
+        const { message_id } = data;
+        const userId = socket.user.id;
+
+        // Check if user is authorized to delete (sender or recipient)
+        const messageResult = await pool.query(`
+          SELECT m.*, cp.user_id as participant_user_id
+          FROM messages m
+          JOIN conversation_participants cp ON m.conversation_id = cp.conversation_id
+          WHERE m.id = $1 AND (m.sender_id = $2 OR cp.user_id = $2)
+        `, [message_id, userId]);
+
+        if (messageResult.rows.length === 0) {
+          socket.emit('error', { message: 'Not authorized to delete this message' });
+          return;
+        }
+
+        const message = messageResult.rows[0];
+
+        // Mark message as deleted
+        await pool.query(
+          'UPDATE messages SET deleted_at = NOW(), deleted_by = $1 WHERE id = $2',
+          [userId, message_id]
+        );
+
+        // Notify all conversation participants
+        io.to(`conversation_${message.conversation_id}`).emit('message_deleted', {
+          message_id: message_id,
+          deleted_by: socket.user.username,
+          deleted_at: new Date()
+        });
+
+        console.log(`🗑️ Message ${message_id} deleted by ${socket.user.username}`);
+
+      } catch (error) {
+        console.error('Delete message error:', error);
+        socket.emit('error', { message: 'Failed to delete message' });
       }
     });
 
