@@ -1,5 +1,7 @@
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const bcrypt = require('bcrypt');
+const fs = require('fs');
 
 const pool = new Pool({
   user: 'vanish_user',
@@ -8,6 +10,7 @@ const pool = new Pool({
   password: 'vanish123',
   port: 5432
 });
+
 
 // Decrypt message with sender's key
 const decryptMessage = (encryptedContent, senderKey) => {
@@ -28,32 +31,14 @@ const decryptMessage = (encryptedContent, senderKey) => {
 };
 
 // Generate fake base64 decoy content
-const generateDecoy = (originalMessageLength) => {
-  // Create realistic decoy length (1.3x to 1.8x original length)
-  const multiplier = 1.3 + (Math.random() * 0.5);
-  const targetLength = Math.ceil(originalMessageLength * multiplier);
-  
-  // Generate random bytes and convert to base64
-  const randomBytes = crypto.randomBytes(targetLength);
-  let decoy = randomBytes.toString('base64');
-  
-  // Add some realistic-looking structure occasionally
-  if (Math.random() > 0.5) {
-    // Insert some dots, equals signs, and slashes to make it look more authentic
-    const insertions = ['...', '==', '//', '::'];
-    const randomInsertion = insertions[Math.floor(Math.random() * insertions.length)];
-    const insertPosition = Math.floor(decoy.length * Math.random());
-    decoy = decoy.slice(0, insertPosition) + randomInsertion + decoy.slice(insertPosition);
+const generateDecoy = (targetLength) => {
+  const scrambleChars = '█▓▒░ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let decoy = '';
+  for (let i = 0; i < targetLength; i++) {
+    decoy += scrambleChars[Math.floor(Math.random() * scrambleChars.length)];
   }
-  
-  // Ensure minimum length for very short messages
-  if (decoy.length < 50) {
-    decoy += crypto.randomBytes(30).toString('base64');
-  }
-  
   return decoy;
 };
-
 // Initialize Socket.IO with revolutionary features
 const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
   
@@ -65,9 +50,122 @@ const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
     // Join user to their personal room for notifications
     socket.join(`user_${socket.user.id}`);
 
+    socket.on('join_conversation', (data) => {
+    const { conversation_id } = data;
+    socket.join(`conversation_${conversation_id}`);
+    console.log(`📲 User ${socket.user.username} successfully joined room: conversation_${conversation_id}`);
+});
+
     // Join user to their conversation rooms
     joinUserConversations(socket);
+    
 
+    // === NEW EVENT HANDLER for Live Typing Preview ===
+socket.on('live_typing_update', (data) => {
+    const { conversation_id, text_length } = data;
+    if (typeof text_length !== 'number' || text_length < 0 || text_length > 5000) return;
+    const liveDecoy = generateDecoy(text_length);
+    const payload = {
+        sender_id: socket.user.id,
+        sender_username: socket.user.username,
+        decoy_content: liveDecoy
+    };
+    // **DEBUGGING**: Log before broadcasting
+    console.log(`📡 [SERVER-BROADCAST] Broadcasting to room: conversation_${conversation_id}`);
+    console.log('🔥 [SERVER-GENERATE] Generated decoy:', liveDecoy);
+    socket.to(`conversation_${conversation_id}`).emit('live_decoy_update', payload);
+});
+
+    socket.on('mark_conversation_as_read', async (data) => {
+  try {
+    const { conversation_id } = data;
+    const userId = socket.user.id;
+
+    const updateResult = await pool.query(
+      `UPDATE messages SET is_seen = true 
+       WHERE conversation_id = $1 AND sender_id != $2 AND is_seen = false
+       RETURNING id, sender_id`,
+      [conversation_id, userId]
+    );
+
+    // Notify the senders that their messages have been seen
+    const notifications = {};
+    for (const row of updateResult.rows) {
+      if (!notifications[row.sender_id]) {
+        notifications[row.sender_id] = [];
+      }
+      notifications[row.sender_id].push(row.id);
+    }
+
+    for (const senderId in notifications) {
+      io.to(`user_${senderId}`).emit('messages_seen_update', {
+        message_ids: notifications[senderId],
+        conversation_id: conversation_id
+      });
+    }
+
+  } catch (error) {
+    console.error('Mark as read error:', error);
+  }
+});
+
+// Handle creation of a file message after upload
+// === DEFINITIVE REPLACEMENT for send_file_message ===
+socket.on('send_file_message', async (data) => {
+    try {
+        const { conversation_id, sender_key, file_metadata, ephemeral_type } = data;
+        const senderId = socket.user.id;
+
+        const contentPayload = {
+            originalName: file_metadata.originalName,
+            size: file_metadata.size
+        };
+
+        const algorithm = 'aes-256-cbc';
+        const key = crypto.scryptSync(sender_key, 'vanish-salt', 32);
+        const iv = crypto.randomBytes(16);
+        const cipher = crypto.createCipheriv(algorithm, key, iv);
+        let encryptedContent = cipher.update(JSON.stringify(contentPayload), 'utf8', 'hex');
+        encryptedContent += cipher.final('hex');
+        const finalEncryptedContent = `${encryptedContent}:${iv.toString('hex')}`;
+
+        const decoyContent = generateDecoy(file_metadata.originalName.length + 20);
+
+        const serverMetadata = {
+            path: file_metadata.path,
+            mimeType: file_metadata.mimeType
+        };
+
+        const result = await pool.query(`
+            INSERT INTO messages (conversation_id, sender_id, content, decoy_content, message_type, file_metadata, ephemeral_type, is_encrypted_display, created_at)
+            VALUES ($1, $2, $3, $4, 'file', $5, $6, true, NOW())
+            RETURNING *
+        `, [conversation_id, senderId, finalEncryptedContent, decoyContent, serverMetadata, ephemeral_type]);
+        const message = result.rows[0];
+        
+        await pool.query('UPDATE conversations SET last_message_at = NOW() WHERE id = $1', [conversation_id]);
+
+        // **THE FIX**: This object now perfectly mirrors the API structure.
+        const messageData = {
+            id: message.id,
+            conversation_id: message.conversation_id,
+            sender_id: message.sender_id,
+            message_type: 'file',
+            file_metadata: message.file_metadata, // This is the crucial addition.
+            ephemeral_type: message.ephemeral_type,
+            is_encrypted_display: true,
+            is_decrypted: false,
+            is_seen: false,
+            created_at: message.created_at,
+            content: message.decoy_content 
+        };
+        io.to(`conversation_${conversation_id}`).emit('new_message', messageData);
+
+    } catch (error) {
+        console.error('Send file message error:', error);
+        socket.emit('error', { message: 'Failed to send file message.' });
+    }
+});
     // Handle joining conversation rooms
     socket.on('join_conversation', async (data) => {
       try {
@@ -91,141 +189,103 @@ const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
     // REPLACE your entire send_message handler (around lines 75-130) with this:
 
     socket.on('send_message', async (data) => {
-      try {
-        const { conversation_id, content, sender_key, key_hint, message_type = 'text' } = data;
-        const senderId = socket.user.id;
+  try {
+    const { conversation_id, content, sender_key, message_type = 'text' } = data;
+    const senderId = socket.user.id;
+    
+    const participantCheck = await pool.query(
+      'SELECT id FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
+      [conversation_id, senderId]
+    );
+    if (participantCheck.rows.length === 0) {
+      return socket.emit('error', { message: 'Not authorized to send messages' });
+    }
 
-        // Verify user is participant
-        const participantCheck = await pool.query(
-          'SELECT id FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
-          [conversation_id, senderId]
-        );
+    const algorithm = 'aes-256-cbc';
+    const key = crypto.scryptSync(sender_key, 'vanish-salt', 32);
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv(algorithm, key, iv);
+    let encrypted = cipher.update(content, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const encryptedContent = `${encrypted}:${iv.toString('hex')}`;
 
-        if (participantCheck.rows.length === 0) {
-          socket.emit('error', { message: 'Not authorized to send messages' });
-          return;
-        }
+    // Generate the final, static decoy for the permanent message bubble.
+    const staticDecoy = generateDecoy(content.length <= 50 ? content.length + 10 : content.length + 20);
 
-        // Encrypt message
-        const algorithm = 'aes-256-cbc';
-        const key = crypto.scryptSync(sender_key, 'vanish-salt', 32);
-        const iv = crypto.randomBytes(16);
-        
-        const cipher = crypto.createCipheriv(algorithm, key, iv);
-        let encrypted = cipher.update(content, 'utf8', 'hex');
-        encrypted += cipher.final('hex');
-        
-        const encryptedContent = `${encrypted}:${iv.toString('hex')}`;
+    const destructionTimer = content.length <= 50 ? 60 : 
+                           content.length <= 200 ? 120 : 
+                           content.length <= 500 ? 180 : 240;
 
-        // Generate decoy content
-        const decoyContent = generateDecoy(content.length);
+    const result = await pool.query(`
+      INSERT INTO messages (conversation_id, sender_id, content, decoy_content, message_type, self_destruct_timer, is_encrypted_display, created_at) 
+      VALUES ($1, $2, $3, $4, $5, $6, true, NOW()) 
+      RETURNING *
+    `, [conversation_id, senderId, encryptedContent, staticDecoy, message_type, destructionTimer]);
+    const message = result.rows[0];
 
-        // Calculate self-destruction time
-        const destructionTimer = content.length <= 50 ? 60 : 
-                               content.length <= 200 ? 120 : 
-                               content.length <= 500 ? 180 : 240;
+    await pool.query('UPDATE conversations SET last_message_at = NOW() WHERE id = $1', [conversation_id]);
 
-        // Store message with decoy
-        const result = await pool.query(`
-          INSERT INTO messages (
-            conversation_id, sender_id, content, message_type, 
-            sender_key_hint, self_destruct_timer, decoy_content, 
-            is_encrypted_display, is_seen, created_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) 
-          RETURNING *
-        `, [conversation_id, senderId, encryptedContent, message_type, key_hint, destructionTimer, decoyContent, true, false]);
+    // **THE FIX**: Instead of 'new_message', we emit a new 'finalize_message' event.
+    // This tells the client to perform the shimmer transition.
+    const messageData = {
+      id: message.id,
+      conversation_id: message.conversation_id,
+      sender_id: message.sender_id,
+      content: message.decoy_content, // This is the Static Decoy (Decoy B)
+      message_type: message.message_type,
+      is_encrypted_display: true,
+      is_decrypted: false,
+      is_seen: false,
+      self_destruct_timer: message.self_destruct_timer,
+      created_at: message.created_at,
+      expires_at: message.expires_at,
+    };
 
-        const message = result.rows[0];
+    io.to(`conversation_${conversation_id}`).emit('finalize_message', messageData);
+    console.log(`💬 Message ${message.id} finalized and sent to conversation ${conversation_id}`);
 
-        // Update conversation last message time
-        await pool.query(
-          'UPDATE conversations SET last_message_at = NOW() WHERE id = $1',
-          [conversation_id]
-        );
+  } catch (error) {
+    console.error('Send message error:', error);
+    socket.emit('error', { message: 'Failed to send message' });
+  }
+});
 
-        // Broadcast to conversation participants
-        const messageData = {
-          id: message.id,
-          conversation_id: message.conversation_id,
-          sender_id: message.sender_id,
-          sender_username: socket.user.username,
-          sender_photo: socket.user.profile_photo,
-          message_type: message.message_type,
-          sender_key_hint: message.sender_key_hint,
-          is_encrypted_display: true,
-          is_decrypted: false,
-          is_seen: false,
-          self_destruct_timer: message.self_destruct_timer,
-          created_at: message.created_at,
-          content: decoyContent,  // Show decoy to everyone initially
-          decoy_content: decoyContent
-        };
-
-        io.to(`conversation_${conversation_id}`).emit('new_message', messageData);
-        console.log(`💬 Message sent in conversation ${conversation_id} with decoy`);
-
-      } catch (error) {
-        console.error('Send message error:', error);
-        socket.emit('error', { message: 'Failed to send message' });
-      }
-    });
     // Handle decryption request (revolutionary feature)
-    socket.on('request_decryption', async (data) => {
-      try {
-        const { message_id } = data;
-        const requesterId = socket.user.id;
+   socket.on('request_decryption', async (data) => {
+  try {
+    const { message_id } = data;
+    const requesterId = socket.user.id;
 
-        // Get message details
-        const messageResult = await pool.query(
-          'SELECT * FROM messages WHERE id = $1',
-          [message_id]
-        );
+    const messageResult = await pool.query('SELECT * FROM messages WHERE id = $1', [message_id]);
+    if (messageResult.rows.length === 0) {
+      return socket.emit('error', { message: 'Message not found' });
+    }
+    const message = messageResult.rows[0];
 
-        if (messageResult.rows.length === 0) {
-          socket.emit('error', { message: 'Message not found' });
-          return;
-        }
+    if (message.sender_id === requesterId) {
+      return socket.emit('error', { message: 'Cannot request decryption of your own message' });
+    }
 
-        const message = messageResult.rows[0];
+    // Create decryption request, now including conversation_id
+    const requestResult = await pool.query(`
+      INSERT INTO decryption_requests (message_id, requester_id, sender_id, conversation_id, status)
+      VALUES ($1, $2, $3, $4, 'pending') 
+      RETURNING *
+    `, [message_id, requesterId, message.sender_id, message.conversation_id]);
+    const request = requestResult.rows[0];
 
-        // Don't allow sender to request their own message
-        if (message.sender_id === requesterId) {
-          socket.emit('error', { message: 'Cannot request decryption of your own message' });
-          return;
-        }
-
-        // Create decryption request
-        const requestResult = await pool.query(`
-          INSERT INTO decryption_requests (
-            message_id, requester_id, sender_id, status
-          ) VALUES ($1, $2, $3, 'pending') 
-          RETURNING *
-        `, [message_id, requesterId, message.sender_id]);
-
-        const request = requestResult.rows[0];
-
-        // Notify sender about decryption request
-        io.to(`user_${message.sender_id}`).emit('decryption_request', {
-          request_id: request.id,
-          message_id: message_id,
-          requester_username: socket.user.username,
-          requester_photo: socket.user.profile_photo,
-          key_hint: message.sender_key_hint,
-          requested_at: request.requested_at
-        });
-
-        // Confirm to requester
-        socket.emit('decryption_requested', {
-          message: 'Decryption request sent to sender'
-        });
-
-        console.log(`🔓 Decryption requested for message ${message_id}`);
-
-      } catch (error) {
-        console.error('Request decryption error:', error);
-        socket.emit('error', { message: 'Failed to request decryption' });
-      }
+    // Notify sender
+    io.to(`user_${message.sender_id}`).emit('decryption_request', {
+      ...request, // Send the full request object
+      requester_username: socket.user.username,
     });
+
+    console.log(`🔓 Decryption requested for message ${message_id}`);
+  } catch (error) {
+    console.error('Request decryption error:', error);
+    socket.emit('error', { message: 'Failed to request decryption' });
+  }
+});
 
     // Handle sender providing decryption key (revolutionary feature)
     socket.on('provide_decryption_key', async (data) => {
@@ -309,6 +369,46 @@ const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
       }
     });
 
+    // === DEFINITIVE REPLACEMENT for view_once_completed ===
+socket.on('view_once_completed', async (data) => {
+    const { message_id } = data;
+    const userId = socket.user.id; // Get the user who triggered the completion
+
+    try {
+        // 1. Get the message details BEFORE deleting it
+        const result = await pool.query(
+            'SELECT file_metadata, conversation_id FROM messages WHERE id = $1',
+            [message_id]
+        );
+
+        if (result.rows.length > 0) {
+            const message = result.rows[0];
+            const filePath = message.file_metadata.path;
+
+            // 2. Delete the message record from the database
+            await pool.query('DELETE FROM messages WHERE id = $1', [message_id]);
+
+            // 3. Delete the actual file from the server's disk
+            fs.unlink(filePath, (err) => {
+                if (err) {
+                    console.error(`Failed to delete file ${filePath}:`, err);
+                } else {
+                    console.log(`🗑️ View Once file ${filePath} permanently deleted by user ${userId}.`);
+                }
+            });
+
+            // 4. **THE FIX**: Notify all clients in the conversation to remove the message from their UI.
+            // This provides the "zero trace" real-time vanishing effect.
+            io.to(`conversation_${message.conversation_id}`).emit('message_deleted', { 
+                message_id: message_id,
+                conversation_id: message.conversation_id
+            });
+        }
+    } catch (error) {
+        console.error('View once completion error:', error);
+    }
+});
+
     // Handle message seen (read receipt)
     socket.on('message_seen', async (data) => {
       try {
@@ -340,146 +440,195 @@ const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
     });
 
     // Handle inline decryption request
-    socket.on('inline_decryption_request', async (data) => {
-      try {
-        const { message_id, sender_id } = data;
-        const requesterId = socket.user.id;
+   socket.on('inline_decryption_request', async (data) => {
+  try {
+    const { message_id, sender_id } = data;
+    const requesterId = socket.user.id;
 
-        // Get message details
-        const messageResult = await pool.query(
-          'SELECT * FROM messages WHERE id = $1',
-          [message_id]
-        );
+    const messageResult = await pool.query('SELECT * FROM messages WHERE id = $1 AND sender_id = $2', [message_id, sender_id]);
+    if (messageResult.rows.length === 0) {
+      return socket.emit('error', { message: 'Message not found for this request.' });
+    }
+    const message = messageResult.rows[0];
 
-        if (messageResult.rows.length === 0) {
-          socket.emit('error', { message: 'Message not found' });
-          return;
-        }
+    if (message.sender_id === requesterId) {
+      return socket.emit('error', { message: 'Cannot request decryption of your own message' });
+    }
 
-        const message = messageResult.rows[0];
+    // Attempt to save the request to the database for persistence.
+    // ON CONFLICT will safely ignore duplicates.
+    await pool.query(`
+      INSERT INTO decryption_requests (message_id, requester_id, sender_id, conversation_id, status)
+      VALUES ($1, $2, $3, $4, 'pending')
+      ON CONFLICT (message_id, requester_id) DO NOTHING
+    `, [message_id, requesterId, message.sender_id, message.conversation_id]);
+    
+    // **THE FIX**: Always emit the real-time event to the sender, regardless of DB result.
+    // We fetch the latest request info to ensure the payload is complete.
+    const latestRequestInfo = await pool.query(
+        'SELECT * FROM decryption_requests WHERE message_id = $1 AND requester_id = $2',
+        [message_id, requesterId]
+    );
 
-        // Don't allow sender to request their own message
-        if (message.sender_id === requesterId) {
-          socket.emit('error', { message: 'Cannot request decryption of your own message' });
-          return;
-        }
+    if (latestRequestInfo.rows.length > 0) {
+        const requestPayload = {
+            ...latestRequestInfo.rows[0],
+            requester_username: socket.user.username
+        };
+        io.to(`user_${sender_id}`).emit('decryption_request', requestPayload);
+        console.log(`📡 Real-time decryption request for message ${message_id} sent to sender.`);
+    }
 
-        // Notify sender about inline decryption request
-        io.to(`user_${sender_id}`).emit('inline_decryption_request', {
-          message_id: message_id,
-          requester_username: socket.user.username,
-          requester_id: requesterId,
-          key_hint: message.sender_key_hint
-        });
-
-        console.log(`🔓 Inline decryption requested for message ${message_id}`);
-
-      } catch (error) {
-        console.error('Inline decryption request error:', error);
-        socket.emit('error', { message: 'Failed to request decryption' });
-      }
-    });
+  } catch (error) {
+    console.error('Inline decryption request error:', error);
+    socket.emit('error', { message: 'Failed to request decryption' });
+  }
+});
 
     // Handle inline decryption key provision
-    socket.on('provide_inline_decryption', async (data) => {
-      try {
-        const { message_id, decryption_key, approve = true } = data;
+// STEP 1: Sender provides THEIR key, which we verify and temporarily store.
+socket.on('sender_provide_key', async (data) => {
+    try {
+        const { message_id, decryption_key } = data;
         const senderId = socket.user.id;
 
-        // Get message
-        const messageResult = await pool.query(
-          'SELECT * FROM messages WHERE id = $1 AND sender_id = $2',
-          [message_id, senderId]
-        );
-
+        const messageResult = await pool.query('SELECT * FROM messages WHERE id = $1 AND sender_id = $2', [message_id, senderId]);
         if (messageResult.rows.length === 0) {
-          socket.emit('error', { message: 'Message not found or not authorized' });
-          return;
+            return socket.emit('error', { message: 'Message not found or you are not authorized.' });
         }
-
+        
         const message = messageResult.rows[0];
 
-        if (!approve) {
-          // Deny decryption request
-          io.to(`conversation_${message.conversation_id}`).emit('inline_decryption_denied', {
-            message_id: message_id,
-            message: 'Sender denied decryption request'
-          });
-
-          socket.emit('decryption_response_sent', { message: 'Decryption request denied' });
-          return;
+        // We MUST verify the sender's key is correct by actually trying to decrypt.
+        try {
+            decryptMessage(message.content, decryption_key);
+        } catch (e) {
+            console.log(`User ${senderId} provided an invalid key for message ${message_id}`);
+            return socket.emit('error', { message: 'Invalid decryption key provided.' });
         }
 
-        // Try to decrypt with provided key
-        const decryptedContent = decryptMessage(message.content, decryption_key);
-
-        // Update message as decrypted
+        // Key is valid. Store it securely in our temporary table.
         await pool.query(
-          'UPDATE messages SET is_decrypted = true, is_encrypted_display = false WHERE id = $1',
-          [message_id]
+            'INSERT INTO approved_decryptions (message_id, sender_key) VALUES ($1, $2) ON CONFLICT (message_id) DO UPDATE SET sender_key = EXCLUDED.sender_key',
+            [message_id, decryption_key]
         );
 
-        // Emit decryption animation to all conversation participants
-        io.to(`conversation_${message.conversation_id}`).emit('start_decryption_animation', {
-          message_id: message_id,
-          decoy_content: message.decoy_content,
-          real_content: decryptedContent,
-          self_destruct_timer: message.self_destruct_timer
+        // Now, broadcast that the sender has approved.
+        io.to(`conversation_${message.conversation_id}`).emit('sender_approved_decryption', {
+            message_id: message_id,
+            sender_id: senderId
         });
+        console.log(`Sender ${senderId} approved decryption for message ${message_id}. Key stored temporarily.`);
 
-        console.log(`🔑 Message ${message_id} decrypted inline successfully`);
+    } catch (error) {
+        console.error('Sender provide key error:', error);
+        socket.emit('error', { message: 'Failed to process sender key' });
+    }
+});
 
-      } catch (error) {
-        console.error('Provide inline decryption error:', error);
-        socket.emit('error', { 
-          message: error.message.includes('Invalid decryption key') ? 
-                   'Invalid decryption key' : 'Failed to decrypt message' 
-        });
-      }
-    });
+// STEP 2: Receiver provides THEIR key, which we verify before triggering final decryption.
+// === DEFINITIVE REPLACEMENT for receiver_provide_key ===
+socket.on('receiver_provide_key', async (data) => {
+    try {
+        const { message_id, decryption_key } = data;
+        const receiverId = socket.user.id;
+        
+        const messageResult = await pool.query('SELECT * FROM messages WHERE id = $1', [message_id]);
+        if (messageResult.rows.length === 0) return socket.emit('error', { message: 'Message not found.' });
+        const message = messageResult.rows[0];
+
+        const convKeyResult = await pool.query('SELECT decryption_key_hash FROM conversation_keys WHERE conversation_id = $1 AND user_id = $2', [message.conversation_id, receiverId]);
+        if (convKeyResult.rows.length === 0) return socket.emit('error', { message: 'You have not set a Personal Decryption Key.' });
+        const { decryption_key_hash } = convKeyResult.rows[0];
+        const isKeyValid = await bcrypt.compare(decryption_key, decryption_key_hash);
+        if (!isKeyValid) return socket.emit('error', { message: 'Invalid Personal Decryption Key.' });
+
+        const approvedKeyResult = await pool.query('SELECT sender_key FROM approved_decryptions WHERE message_id = $1', [message_id]);
+        if (approvedKeyResult.rows.length === 0) return socket.emit('error', { message: 'Sender has not approved this decryption yet.' });
+        const senderKey = approvedKeyResult.rows[0].sender_key;
+
+        const decryptedContent = decryptMessage(message.content, senderKey);
+
+        if (message.message_type === 'text') {
+            const updateResult = await pool.query(
+              `UPDATE messages SET is_decrypted = true, is_encrypted_display = false, content = $1, expires_at = NOW() + (COALESCE(self_destruct_timer, 60) * INTERVAL '1 second') WHERE id = $2 RETURNING expires_at`,
+              [decryptedContent, message_id]
+            );
+            io.to(`conversation_${message.conversation_id}`).emit('start_decryption_animation', {
+              message_id: message_id,
+              decoy_content: message.decoy_content,
+              real_content: decryptedContent,
+              self_destruct_timer: message.self_destruct_timer,
+              expires_at: updateResult.rows[0].expires_at
+            });
+        } else if (message.message_type === 'file') {
+            const decryptedMetadata = JSON.parse(decryptedContent);
+            const singleUseToken = crypto.randomBytes(32).toString('hex');
+            const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+            // **THE FIX**: Store the sender's key WITH the download token.
+            await pool.query(
+                'INSERT INTO download_tokens (token, message_id, user_id, expires_at, sender_key) VALUES ($1, $2, $3, $4, $5)',
+                [singleUseToken, message_id, receiverId, expiresAt, senderKey]
+            );
+
+            await pool.query('UPDATE messages SET is_decrypted = true WHERE id = $1', [message_id]);
+
+            io.to(`conversation_${message.conversation_id}`).emit('file_decrypted_successfully', {
+                message_id: message_id,
+                decrypted_metadata: decryptedMetadata,
+                download_token: singleUseToken
+            });
+        }
+        
+        // Now it is safe to delete the approval record.
+        await pool.query('DELETE FROM approved_decryptions WHERE message_id = $1', [message_id]);
+        console.log(`🔑 Message ${message_id} decrypted by ${receiverId}. Approval key moved to token.`);
+    } catch (error) {
+         console.error('Receiver provide key error:', error);
+         socket.emit('error', { message: 'Failed to process receiver key.' });
+    }
+});
 
     // Handle delete message
     socket.on('delete_message', async (data) => {
-      try {
-        const { message_id } = data;
-        const userId = socket.user.id;
+  try {
+    const { message_id } = data;
+    const userId = socket.user.id;
 
-        // Check if user is authorized to delete (sender or recipient)
-        const messageResult = await pool.query(`
-          SELECT m.*, cp.user_id as participant_user_id
-          FROM messages m
-          JOIN conversation_participants cp ON m.conversation_id = cp.conversation_id
-          WHERE m.id = $1 AND (m.sender_id = $2 OR cp.user_id = $2)
-        `, [message_id, userId]);
+    const messageResult = await pool.query('SELECT * FROM messages WHERE id = $1', [message_id]);
+    if (messageResult.rows.length === 0) {
+      return socket.emit('error', { message: 'Message not found.' });
+    }
+    const message = messageResult.rows[0];
 
-        if (messageResult.rows.length === 0) {
-          socket.emit('error', { message: 'Not authorized to delete this message' });
-          return;
-        }
-
-        const message = messageResult.rows[0];
-
-        // Mark message as deleted
-        await pool.query(
-          'UPDATE messages SET deleted_at = NOW(), deleted_by = $1 WHERE id = $2',
-          [userId, message_id]
-        );
-
-        // Notify all conversation participants
-        io.to(`conversation_${message.conversation_id}`).emit('message_deleted', {
-          message_id: message_id,
-          deleted_by: socket.user.username,
-          deleted_at: new Date()
-        });
-
-        console.log(`🗑️ Message ${message_id} deleted by ${socket.user.username}`);
-
-      } catch (error) {
-        console.error('Delete message error:', error);
-        socket.emit('error', { message: 'Failed to delete message' });
-      }
-    });
-
+    // SENDER: Deletes for everyone.
+    if (message.sender_id === userId) {
+      await pool.query('DELETE FROM messages WHERE id = $1', [message_id]);
+      io.to(`conversation_${message.conversation_id}`).emit('message_deleted', {
+        message_id: message_id,
+        conversation_id: message.conversation_id
+      });
+      console.log(`🗑️ Message ${message_id} deleted for everyone by sender ${userId}`);
+    } 
+    // RECEIVER: Deletes only for themselves.
+    else {
+      await pool.query(
+        'INSERT INTO user_message_deletions (user_id, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [userId, message_id]
+      );
+      // Notify only the user who deleted it
+      socket.emit('message_deleted', {
+        message_id: message_id,
+        conversation_id: message.conversation_id
+      });
+      console.log(`🗑️ Message ${message_id} deleted for receiver ${userId}`);
+    }
+  } catch (error) {
+    console.error('Delete message error:', error);
+    socket.emit('error', { message: 'Failed to delete message' });
+  }
+});
     // Handle typing indicators
     socket.on('typing', (data) => {
       const { conversation_id, is_typing } = data;
