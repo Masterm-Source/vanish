@@ -8,7 +8,8 @@ import LivePreview from './components/LivePreview';
 import { Paperclip } from 'lucide-react'; // Add Paperclip icon
 import { motion, AnimatePresence } from 'framer-motion';
 import Picker, { Theme } from 'emoji-picker-react';
-import toast, { Toaster } from 'react-hot-toast';import { 
+import toast, { Toaster } from 'react-hot-toast';
+import { 
   MessageCircle, 
   Send,
   Smile, 
@@ -23,7 +24,10 @@ import toast, { Toaster } from 'react-hot-toast';import {
   UserPlus,
   Volume2,
   VolumeX,
-  Users
+  Users,
+  Trash2, 
+  ShieldOff,
+  ShieldCheck 
 } from 'lucide-react';
 import './App.css';
 import KeyChangeModal from './components/KeyChangeModal';
@@ -62,7 +66,7 @@ const App = () => {
   // Socket connection
   const [socket, setSocket] = useState(null);
   const messagesEndRef = useRef(null);
-  
+  const selectedConversationRef = useRef(null);
   // Revolutionary features
   const [typingUsers, setTypingUsers] = useState([]);
   const [isTyping, setIsTyping] = useState(false);
@@ -71,6 +75,8 @@ const App = () => {
 // Add these new states after your existing state declarations
 const [openDropdown, setOpenDropdown] = useState(null);
 const [pendingDecryption, setPendingDecryption] = useState({});
+const [openContactDropdown, setOpenContactDropdown] = useState(null);
+const [openConversationDropdown, setOpenConversationDropdown] = useState(null);
 const [decryptionInputs, setDecryptionInputs] = useState({});
 const [isDecrypting, setIsDecrypting] = useState({});
 const [successMessages, setSuccessMessages] = useState(new Set());
@@ -87,6 +93,8 @@ const [showEmojiPicker, setShowEmojiPicker] = useState(false);
 const [fileToUpload, setFileToUpload] = useState(null);
 const [viewOnceMedia, setViewOnceMedia] = useState({ message: null, file: null });
 const fileInputRef = useRef(null);
+const [finalizingConversationId, setFinalizingConversationId] = useState(null);
+const [finalizingMessageData, setFinalizingMessageData] = useState(null);
 // State for our new audio files
 const decryptionSoundRef = useRef(null);
 const completionSoundRef = useRef(null);
@@ -96,6 +104,7 @@ const notificationSoundRef = useRef(null);
 const [liveDecoys, setLiveDecoys] = useState({});
 // Sound effect functions using pre-loaded audio files
 // Sound effect functions using on-demand loading and useRef
+
 
 // ADD THIS ENTIRE NEW FUNCTION
 const initializeAudio = () => {
@@ -237,6 +246,8 @@ const handleViewOnceComplete = (messageId) => {
   };
 
 
+  
+
   // Authentication functions
   const handleLogout = () => {
     localStorage.removeItem('token');
@@ -274,6 +285,7 @@ const handleInlineDecryptionRequest = (messageId) => {
     socket.emit('request_decryption', { message_id: messageId });
     toast.success('🔓 Decryption request sent');
   }
+  setOpenDropdown(null);
 };
 
 // Handle decryption input
@@ -438,26 +450,23 @@ const startDecryptionAnimation = async (messageId, decoyContent, realContent, se
 
         // Attach socket event listeners
     socket.on('live_decoy_update', (data) => {
-      console.log('📡 [CLIENT-RECEIVE] Got live_decoy_update:', data);
-      console.log('📡 [CLIENT-RECEIVE] Current selected conversation:', selectedConversation?.id);
-      console.log('📡 [CLIENT-RECEIVE] Data conversation_id:', data.conversation_id);
-      console.log('📡 [CLIENT-RECEIVE] Should update?', selectedConversation && selectedConversation.id === data.conversation_id);
-
-      const { conversation_id, sender_username, decoy_content } = data;
-      
-      if (selectedConversation && selectedConversation.id === conversation_id) {
-          setLiveDecoys(prev => {
-              const newDecoys = {
-                  ...prev,
-                  [conversation_id]: { sender_username, decoy_content }
-              };
-              console.log('📡 [CLIENT-RECEIVE] New liveDecoys state:', newDecoys);
-              return newDecoys;
-          });
-      } else {
-          console.log('📡 [CLIENT-RECEIVE] Ignoring - wrong conversation or no selected conversation');
-      }
-    });
+    console.log('📡 [CLIENT-RECEIVE] Got live_decoy_update:', data);
+    
+    const { sender_username, decoy_content } = data;
+    
+    // Use the current selected conversation ID since backend isn't sending it
+    if (selectedConversation) {
+        setLiveDecoys(prev => {
+            const newDecoys = {
+                ...prev,
+                [selectedConversation.id]: { sender_username, decoy_content }
+            };
+            console.log('📡 [CLIENT-RECEIVE] Updated liveDecoys:', newDecoys);
+            console.log('📡 [CLIENT-RECEIVE] Keys after update:', Object.keys(newDecoys));
+            return newDecoys;
+        });
+    }
+});
 
         socket.on('finalize_message', (finalMessageObject) => {
             const { conversation_id } = finalMessageObject;
@@ -648,30 +657,92 @@ const startDecryptionAnimation = async (messageId, decoyContent, realContent, se
     }
 }, [token]);
 
+const handleFinalizationComplete = () => {
+    if (!finalizingMessageData) return;
+
+    // Add the now-permanent message to the chat
+    setMessages(prevMessages => {
+        const messageExists = prevMessages.some(msg => msg.id === finalizingMessageData.id);
+        if (!messageExists) {
+            return [...prevMessages, finalizingMessageData];
+        }
+        return prevMessages;
+    });
+    
+    // Update the conversation list with the new last message time
+    setConversations(prevConvos => 
+        prevConvos.map(convo => 
+            convo.id === finalizingMessageData.conversation_id 
+            ? { ...convo, last_message_at: finalizingMessageData.created_at } 
+            : convo
+        ).sort((a, b) => new Date(b.last_message_at) - new Date(a.last_message_at))
+    );
+
+    // Clean up all the temporary states
+    setLiveDecoys(prev => {
+        const newDecoys = { ...prev };
+        delete newDecoys[finalizingMessageData.conversation_id];
+        return newDecoys;
+    });
+    setFinalizingConversationId(null);
+    setFinalizingMessageData(null);
+  };
+
 // Additional socket event handlers useEffect
 useEffect(() => {
-    const handleSenderApproved = (data) => {
+        const handleSenderApproved = (data) => {
         const { message_id } = data;
-        toast.success('Sender has approved your request.');
+        toast.success('Sender has approved your request. Please enter your key to decrypt.');
         setSenderApprovals(prev => ({ ...prev, [message_id]: true }));
+        // THIS IS THE FIX: This line makes the input box appear for the receiver.
+        setPendingDecryption(prev => ({ ...prev, [message_id]: true }));
     };
 
     const handleLiveDecoyUpdate = (data) => {
         const { conversation_id, sender_username, decoy_content } = data;
-        if (selectedConversation && selectedConversation.id === conversation_id) {
-            setLiveDecoys({ [conversation_id]: { sender_username, decoy_content } });
-        }
-    };
+         setLiveDecoys(prevDecoys => {
+          const newDecoys = { ...prevDecoys };
+           newDecoys[conversation_id] = { sender_username, decoy_content };
+           return newDecoys;
+    });
+};
+      
+   const handleFinalizeMessage = (finalMessageObject) => {
+    const { conversation_id } = finalMessageObject;
+    // Set both the ID and the new message data (Decoy B) into state
+    setFinalizingConversationId(conversation_id);
+    setFinalizingMessageData(finalMessageObject);
+};
 
-    const handleFinalizeMessage = (finalMessageObject) => {
-        const { conversation_id } = finalMessageObject;
-        setMessages(prev => [...prev, finalMessageObject]);
+    const handleFinalizationComplete = () => {
+        if (!finalizingMessageData) return;
+
+        // Add the now-permanent message to the chat
+        setMessages(prevMessages => {
+            const messageExists = prevMessages.some(msg => msg.id === finalizingMessageData.id);
+            if (!messageExists) {
+                return [...prevMessages, finalizingMessageData];
+            }
+            return prevMessages;
+        });
+        
+        // Update the conversation list with the new last message time
+        setConversations(prevConvos => 
+            prevConvos.map(convo => 
+                convo.id === finalizingMessageData.conversation_id 
+                ? { ...convo, last_message_at: finalizingMessageData.created_at } 
+                : convo
+            ).sort((a, b) => new Date(b.last_message_at) - new Date(a.last_message_at))
+        );
+
+        // Clean up all the temporary states
         setLiveDecoys(prev => {
             const newDecoys = { ...prev };
-            delete newDecoys[conversation_id];
+            delete newDecoys[finalizingMessageData.conversation_id];
             return newDecoys;
         });
-        setConversations(prev => prev.map(c => c.id === conversation_id ? { ...c, last_message_at: finalMessageObject.created_at } : c).sort((a,b) => new Date(b.last_message_at) - new Date(a.last_message_at)));
+        setFinalizingConversationId(null);
+        setFinalizingMessageData(null);
     };
 
     const handleNewFileMessage = (newMessage) => {
@@ -744,17 +815,27 @@ useEffect(() => {
 
   // Authentication functions
 const handleLogin = async (e) => {
-  e.preventDefault();
-  try {
-    const response = await axios.post(`${API_BASE}/auth/login`, loginForm);
-    const { token } = response.data; // We only need the token.
-    localStorage.setItem('token', token);
-    setToken(token); // Setting the token will trigger the new auth useEffect.
-    toast.success('🚀 Welcome to Vanish!');
-  } catch (error) {
-    toast.error(error.response?.data?.error || 'Login failed');
+e.preventDefault();
+try {
+  const response = await axios.post(`${API_BASE}/auth/login`, loginForm);
+  const { token } = response.data; // We only need the token.
+  localStorage.setItem('token', token);
+  setToken(token); // Setting the token will trigger the new auth useEffect.
+  toast.success('🚀 Welcome to Vanish!');
+   } catch (error) {
+      // This new, more robust logic checks if the server's specific error message exists.
+      if (error.response && error.response.data && error.response.data.error) {
+        // If we get a specific message like "User not found" or "Incorrect password", show it.
+        toast.error(error.response.data.error);
+      } else {
+        // If the error is something else (e.g., a network error), show a generic message.
+        toast.error('Login failed. Please check your connection and try again.');
+      }
+      // For debugging, we can still log the whole error object to the console.
+      console.error("Login API Error:", error);
   }
 };
+
     const handleRegister = async (e) => {
   e.preventDefault();
   try {
@@ -891,6 +972,80 @@ const addContact = async (contactId, nickname) => {
     }
   };
 
+const toggleContactDropdown = (contactId, e) => {
+  e.stopPropagation(); // Prevent the conversation from being selected
+  setOpenContactDropdown(prev => (prev === contactId ? null : contactId));
+};
+
+const handleDeleteContact = async (contact, e) => {
+  e.stopPropagation();
+  setOpenContactDropdown(null); // Close dropdown after action
+  if (window.confirm(`Are you sure you want to delete ${contact.nickname || contact.username}? This will also delete your entire conversation history with them.`)) {
+    try {
+      await axios.delete(`${API_BASE}/contacts/${contact.user_id}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      toast.success('Contact deleted successfully');
+      fetchContacts();
+      fetchConversations();
+      // If the deleted contact's conversation was open, close it
+      if (selectedConversation && selectedConversation.other_user_id === contact.user_id) {
+        setSelectedConversation(null);
+      }
+    } catch (error) {
+      toast.error(error.response?.data?.error || 'Failed to delete contact');
+    }
+  }
+};
+
+const handleBlockUser = async (contact, isBlocked, e) => {
+  e.stopPropagation();
+  const action = isBlocked ? 'block' : 'unblock';
+  setOpenContactDropdown(null); // Close dropdown after action
+  if (window.confirm(`Are you sure you want to ${action} ${contact.nickname || contact.username}?`)) {
+    try {
+      await axios.post(`${API_BASE}/contacts/block`, 
+      { blockedId: contact.user_id, isBlocked },
+      { headers: { Authorization: `Bearer ${token}` } }
+      );
+      toast.success(`User ${action}ed`);
+      fetchContacts(); // Refetch to update block status in the UI
+    } catch (error) {
+      toast.error(error.response?.data?.error || `Failed to ${action} user`);
+    }
+  }
+};
+
+const toggleConversationDropdown = (conversationId, e) => {
+  e.stopPropagation(); // Prevents the click from selecting the conversation
+  setOpenConversationDropdown(prev => (prev === conversationId ? null : conversationId));
+};
+
+const handleDeleteConversation = async (conversationId, e) => {
+    e.stopPropagation();
+    setOpenConversationDropdown(null); // Close the dropdown
+
+    if (window.confirm('Are you sure you want to remove this conversation from your list?')) {
+        try {
+            await axios.delete(`${API_BASE}/conversations/${conversationId}`, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            toast.success('Conversation removed');
+
+            // This is the most reliable way to update the UI:
+            // Filter out the deleted conversation from the local state.
+            setConversations(prevConvos => prevConvos.filter(c => c.id !== conversationId));
+            
+            // If the currently open conversation is the one being deleted, close it.
+            if(selectedConversation?.id === conversationId) {
+                setSelectedConversation(null);
+            }
+        } catch (error) {
+            toast.error(error.response?.data?.error || 'Failed to remove conversation');
+        }
+    }
+};
+
   // Revolutionary messaging functions
   const handleSendMessage = async (e) => {
   e.preventDefault();
@@ -932,8 +1087,9 @@ const addContact = async (contactId, nickname) => {
     if (socket) {
       socket.emit('request_decryption', { message_id: messageId });
       toast.success('🔓 Decryption request sent');
-    }
-  };
+   }
+  setOpenDropdown(null);
+};
 
   const handleProvideDecryptionKey = (requestId, key, approve = true) => {
     if (socket) {
@@ -1008,6 +1164,13 @@ const handleSendFile = async (ephemeralType) => {
 useEffect(() => {
     console.log('🎨 [STATE] liveDecoys state changed:', liveDecoys);
     console.log('🎨 [STATE] selectedConversation:', selectedConversation?.id);
+    console.log('🎨 [STATE] liveDecoys state changed:', liveDecoys);
+console.log('🎨 [STATE] liveDecoys keys:', Object.keys(liveDecoys));
+console.log('🎨 [STATE] selectedConversation:', selectedConversation?.id);
+console.log('🎨 [STATE] selectedConversation type:', typeof selectedConversation?.id);
+console.log('🎨 [STATE] Direct access test:', liveDecoys[selectedConversation?.id]);
+console.log('🎨 [STATE] Keys with types:', Object.keys(liveDecoys).map(k => `${k} (${typeof k})`));
+
     console.log('🎨 [STATE] Should render LivePreview:', 
         selectedConversation && liveDecoys[selectedConversation.id]);
 }, [liveDecoys, selectedConversation]);
@@ -1113,6 +1276,7 @@ const handleInlineDecryptionRequest = (messageId) => {
     socket.emit('request_decryption', { message_id: messageId });
     toast.success('🔓 Decryption request sent');
   }
+  setOpenDropdown(null);
 };
 
 // Handle decryption input
@@ -1432,6 +1596,7 @@ useEffect(() => {
 
 useEffect(() => {
   const handleConversationChange = async () => {
+    selectedConversationRef.current = selectedConversation; 
     if (selectedConversation) {
       localStorage.setItem('vanish-last-convo-id', selectedConversation.id);
       
@@ -1464,6 +1629,24 @@ useEffect(() => {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handleOutsideClick = (event) => {
+      // If a dropdown is open and the click did not originate from within a dropdown menu
+      if (openDropdown !== null && !event.target.closest('.message-dropdown')) {
+        setOpenDropdown(null);
+      }
+    };
+
+    // Add the event listener to the whole document
+    document.addEventListener('mousedown', handleOutsideClick);
+
+    // Cleanup the event listener when the component unmounts
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick);
+    };
+  }, [openDropdown]); // This effect depends on the openDropdown state
 
 // This hook now ONLY handles the countdown timer for successfully decrypted messages.
 useEffect(() => {
@@ -1509,50 +1692,61 @@ useEffect(() => {
   // Revolutionary login/register interface
   if (!isAuthenticated) {
     return (
-      <div className="auth-container">
-        <div className="auth-card">
-          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="auth-header">
-            <Shield className="auth-logo" size={48} />
-            <h1>Vanish</h1>
-            <p>Revolutionary Ephemeral Messaging</p>
-          </motion.div>
-          <div className="auth-tabs">
-            <button className={activeView === 'login' ? 'active' : ''} onClick={() => setActiveView('login')}>Login</button>
-            <button className={activeView === 'register' ? 'active' : ''} onClick={() => setActiveView('register')}>Register</button>
+      <>
+        {/*
+          By placing the Toaster here, it is ALWAYS present and
+          ready to display messages on the auth screen.
+        */}
+        <Toaster position="top-right" />
+
+        <div className="auth-container">
+          <div className="auth-card">
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="auth-header">
+              <Shield className="auth-logo" size={48} />
+              <h1>Vanish</h1>
+              <p>Revolutionary Ephemeral Messaging</p>
+            </motion.div>
+            <div className="auth-tabs">
+              <button className={activeView === 'login' ? 'active' : ''} onClick={() => setActiveView('login')}>Login</button>
+              <button className={activeView === 'register' ? 'active' : ''} onClick={() => setActiveView('register')}>Register</button>
+            </div>
+            <AnimatePresence mode="wait">
+              {activeView === 'login' ? (
+                <motion.form key="login" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} onSubmit={handleLogin} className="auth-form">
+                  <div className="form-group"><input type="text" placeholder="Username" value={loginForm.username} onChange={(e) => setLoginForm({...loginForm, username: e.target.value})} required /></div>
+                  <div className="form-group"><input type="password" placeholder="Password" value={loginForm.password} onChange={(e) => setLoginForm({...loginForm, password: e.target.value})} required /></div>
+                  <button type="submit" className="auth-button"><Lock size={20} /> Secure Login</button>
+                </motion.form>
+              ) : (
+                <motion.form key="register" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} onSubmit={handleRegister} className="auth-form">
+                  <div className="form-group"><input type="text" placeholder="Username" value={registerForm.username} onChange={(e) => setRegisterForm({...registerForm, username: e.target.value})} required /></div>
+                  <div className="form-group"><input type="password" placeholder="Password" value={registerForm.password} onChange={(e) => setRegisterForm({...registerForm, password: e.target.value})} required /></div>
+                  <div className="password-rules">
+                    Must be 7+ characters with a letter, number, & special character.
+                  </div>
+                  <div className="form-group"><input type="email" placeholder="Email for Account Security" value={registerForm.email} onChange={(e) => setRegisterForm({...registerForm, email: e.target.value})} required /></div>
+                  <div className="form-group"><input type="text" placeholder="Bio (optional)" value={registerForm.bio} onChange={(e) => setRegisterForm({...registerForm, bio: e.target.value})} /></div>
+                  <button type="submit" className="auth-button"><Shield size={20} /> Create Account</button>
+                </motion.form>
+              )}
+            </AnimatePresence>
           </div>
-          <AnimatePresence mode="wait">
-            {activeView === 'login' ? (
-              <motion.form key="login" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} onSubmit={handleLogin} className="auth-form">
-                <div className="form-group"><input type="text" placeholder="Username" value={loginForm.username} onChange={(e) => setLoginForm({...loginForm, username: e.target.value})} required /></div>
-                <div className="form-group"><input type="password" placeholder="Password" value={loginForm.password} onChange={(e) => setLoginForm({...loginForm, password: e.target.value})} required /></div>
-                <button type="submit" className="auth-button"><Lock size={20} /> Secure Login</button>
-              </motion.form>
-            ) : (
-              <motion.form key="register" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} onSubmit={handleRegister} className="auth-form">
-                <div className="form-group"><input type="text" placeholder="Username" value={registerForm.username} onChange={(e) => setRegisterForm({...registerForm, username: e.target.value})} required /></div>
-                <div className="form-group"><input type="password" placeholder="Password" value={registerForm.password} onChange={(e) => setRegisterForm({...registerForm, password: e.target.value})} required /></div>
-                <div className="form-group"><input type="email" placeholder="Email for Account Security" value={registerForm.email} onChange={(e) => setRegisterForm({...registerForm, email: e.target.value})} required /></div>
-                <div className="form-group"><input type="text" placeholder="Bio (optional)" value={registerForm.bio} onChange={(e) => setRegisterForm({...registerForm, bio: e.target.value})} /></div>
-                <button type="submit" className="auth-button"><Shield size={20} /> Create Account</button>
-              </motion.form>
-            )}
-          </AnimatePresence>
         </div>
-      </div>
+      </>
     );
   }
 
   // Revolutionary WhatsApp-like main interface
   return (
     <div className="chat-container" onClick={initializeAudio}>
-        {/* The AnimatedBackground will go here later if we add it */}
+        {/* The Toaster is now also here, ensuring it works after login as well. */}
         <Toaster position="top-right" />
         <input type="file" ref={fileInputRef} style={{ display: 'none' }} onChange={handleFileSelect} />
         <FileUploadModal file={fileToUpload} onSend={handleSendFile} onCancel={() => setFileToUpload(null)} />
         {viewOnceMedia.file && (
             <MediaViewer 
                 file={viewOnceMedia.file} 
-                onViwed={() => handleViewOnceComplete(viewOnceMedia.message.id)} 
+                onViewed={() => handleViewOnceComplete(viewOnceMedia.message.id)} 
             />
         )}
       
@@ -1604,12 +1798,25 @@ useEffect(() => {
                       {conv.unread_count > 0 && <span className="unread-badge">{conv.unread_count}</span>}
                     </div>
                     <div className="conversation-preview">{conv.message_count} encrypted messages</div>
+                                      {/* --- NEW DROPDOWN UI --- */}
+                  <div className="conversation-dropdown">
+                    <button onClick={(e) => toggleConversationDropdown(conv.id, e)} className="conversation-dropdown-trigger">
+                      •••
+                    </button>
+                    {openConversationDropdown === conv.id && (
+                      <div className="conversation-dropdown-menu">
+                        <button onClick={(e) => handleDeleteConversation(conv.id, e)} className="conversation-dropdown-item delete">
+                          <Trash2 size={14}/>
+                          Delete Conversation
+                        </button>
+                      </div>
+                    )}
+                  </div>
                   </div>
                 </motion.div>
               ))}
           </div>
         ) : (
-          // **THE FIX**: This entire block was missing and has been restored.
           <div className="conversations-list">
             {contactSearchQuery && searchResults.length > 0 && (
               <>
@@ -1641,10 +1848,27 @@ useEffect(() => {
                   <div className="conversation-name">{contact.nickname || contact.username}</div>
                   <div className="conversation-preview">{contact.is_online ? 'Online' : 'Last seen recently'}</div>
                 </div>
-                <div className="conversation-meta">
-                  <button onClick={() => startDirectConversation(contact.user_id)} className="gradient-btn icon-only">
-                    <MessageCircle size={16} />
+                                <div className="contact-actions">
+                  <button onClick={() => startDirectConversation(contact.user_id)} className="contact-action-btn" title="Start Conversation">
+                      <MessageCircle size={16} />
                   </button>
+                  <div className="contact-dropdown">
+                    <button onClick={(e) => toggleContactDropdown(contact.contact_id, e)} className="contact-dropdown-trigger">
+                      •••
+                    </button>
+                    {openContactDropdown === contact.contact_id && (
+                      <div className="contact-dropdown-menu">
+                        <button onClick={(e) => handleBlockUser(contact, !contact.is_blocked, e)} className="contact-dropdown-item block">
+                          {contact.is_blocked ? <ShieldCheck size={14}/> : <ShieldOff size={14}/>}
+                          {contact.is_blocked ? 'Unblock' : 'Block'}
+                        </button>
+                        <button onClick={(e) => handleDeleteContact(contact, e)} className="contact-dropdown-item delete">
+                          <Trash2 size={14}/>
+                          Delete
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             ))}
@@ -1653,17 +1877,17 @@ useEffect(() => {
       </div>
 
       <div 
-  className="chat-area" 
-  style={{
-    backgroundImage: `
-      linear-gradient(rgba(10, 10, 10, 0.85), rgba(10, 10, 10, 0.85)),
-      url('/images/chat-bg.png')
-    `,
-    backgroundSize: 'cover',
-    backgroundPosition: 'center center',
-    backgroundRepeat: 'no-repeat'
-  }}
->
+        className="chat-area" 
+        style={{
+          backgroundImage: `
+            linear-gradient(rgba(10, 10, 10, 0.85), rgba(10, 10, 10, 0.85)),
+            url('/images/chat-bg.png')
+          `,
+          backgroundSize: 'cover',
+          backgroundPosition: 'center center',
+          backgroundRepeat: 'no-repeat'
+        }}
+      >
         {selectedConversation ? (
           <>
             <div className="chat-header">
@@ -1725,11 +1949,14 @@ useEffect(() => {
                 })}
               </AnimatePresence>
 
-   {selectedConversation && liveDecoys[selectedConversation.id] && (
-  <LivePreview
-    decoyData={liveDecoys[selectedConversation.id]}
-      />
-   )}
+                {selectedConversation && liveDecoys[selectedConversation.id] && (
+                    <LivePreview
+                        decoyDataA={liveDecoys[selectedConversation.id]}
+                        decoyDataB={finalizingMessageData}
+                        isFinalizing={finalizingConversationId === selectedConversation.id}
+                        onFinalizationComplete={handleFinalizationComplete}
+                    />
+                )}
               <div ref={messagesEndRef} />
             </motion.div>
             
@@ -1741,29 +1968,16 @@ useEffect(() => {
                 <button type="button" className="icon-btn" onClick={() => setShowEmojiPicker(!showEmojiPicker)}><Smile size={22} /></button>
                 <button type="button" className="icon-btn" onClick={() => fileInputRef.current.click()}><Paperclip size={22} /></button>
                 <input type="text" placeholder="Type a revolutionary message..." value={messageText} onChange={(e) => {
-  const newText = e.target.value;
-  console.log('🎯 [CLIENT-EMIT] Text changed:', newText.length, 'chars');
-  console.log('🎯 [CLIENT-EMIT] Selected conversation:', selectedConversation?.id);
-  console.log('🎯 [CLIENT-EMIT] Socket exists:', !!socket);
-  console.log('🎯 [CLIENT-EMIT] Socket connected:', socket?.connected);
-  setMessageText(newText);
-  handleTyping(); // This handles the "user is typing..." indicator
-
-  // **THE FIX**: Emit the live typing event to the server.
-  if (socket && selectedConversation) {
-     console.log('🎯 [CLIENT-EMIT] Emitting live_typing_update with:', {
-      conversation_id: selectedConversation.id,
-      text_length: newText.length
-    });
-
-    socket.emit('live_typing_update', {
-      conversation_id: selectedConversation.id,
-      text_length: newText.length
-    });
-  } else {
-    console.log('❌ [CLIENT-EMIT] Cannot emit - missing socket or conversation');
-  }
-}} onKeyDown={playTypingSound} required />
+                  const newText = e.target.value;
+                  setMessageText(newText);
+                  handleTyping();
+                  if (socket && selectedConversation) {
+                    socket.emit('live_typing_update', {
+                      conversation_id: selectedConversation.id,
+                      text_length: newText.length
+                    });
+                  }
+                }} onKeyDown={playTypingSound} required />
                 <button type="submit" className="gradient-btn"><Send size={20} /></button>
               </div>
               <div className="encryption-controls">
