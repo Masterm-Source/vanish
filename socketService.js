@@ -11,6 +11,15 @@ const pool = new Pool({
   port: 5432
 });
 
+// (Add this new helper function near the top of socketService.js)
+const areUsersBlocked = async (userId1, userId2) => {
+  const result = await pool.query(
+    'SELECT id FROM blocked_users WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)',
+    [userId1, userId2]
+  );
+  return result.rows.length > 0;
+};
+
 
 // Decrypt message with sender's key
 const decryptMessage = (encryptedContent, senderKey) => {
@@ -59,23 +68,36 @@ const initializeSocket = (io, authenticateSocket, handleDisconnect) => {
     // Join user to their conversation rooms
     joinUserConversations(socket);
     
-
-    // === NEW EVENT HANDLER for Live Typing Preview ===
-socket.on('live_typing_update', (data) => {
-    const { conversation_id, text_length } = data;
-    if (typeof text_length !== 'number' || text_length < 0 || text_length > 5000) return;
-    const liveDecoy = generateDecoy(text_length);
-    const payload = {
-        sender_id: socket.user.id,
-        sender_username: socket.user.username,
-        decoy_content: liveDecoy
-    };
-    // **DEBUGGING**: Log before broadcasting
-    console.log(`📡 [SERVER-BROADCAST] Broadcasting to room: conversation_${conversation_id}`);
-    console.log('🔥 [SERVER-GENERATE] Generated decoy:', liveDecoy);
-    socket.to(`conversation_${conversation_id}`).emit('live_decoy_update', payload);
+    // Live Typing Preview handler
+    socket.on('live_typing_update', async (data) => {
+    try {
+        const { conversation_id, text_length } = data;
+        if (typeof text_length !== 'number' || text_length < 0 || text_length > 5000) return;
+        
+        // --- BLOCK CHECK ---
+        const recipients = await pool.query('SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id != $2', [conversation_id, socket.user.id]);
+        if (recipients.rows.length > 0) {
+          const recipientId = recipients.rows[0].user_id;
+          if (await areUsersBlocked(socket.user.id, recipientId)) {
+            return; // Silently fail to prevent broadcasting typing to a blocked user
+          }
+        }
+        // --- END BLOCK CHECK ---
+        
+        const liveDecoy = generateDecoy(text_length);
+        const payload = {
+            conversation_id,
+            sender_id: socket.user.id,
+            sender_username: socket.user.username,
+            decoy_content: liveDecoy
+        };
+        
+        socket.to(`conversation_${conversation_id}`).emit('live_decoy_update', payload);
+    } catch (error) {
+        console.error('Live typing update error:', error);
+        // We don't emit an error to the client here to avoid spamming them.
+    }
 });
-
     socket.on('mark_conversation_as_read', async (data) => {
   try {
     const { conversation_id } = data;
@@ -201,6 +223,14 @@ socket.on('send_file_message', async (data) => {
       return socket.emit('error', { message: 'Not authorized to send messages' });
     }
 
+    const recipients = await pool.query('SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id != $2', [conversation_id, senderId]);
+if (recipients.rows.length > 0) {
+  const recipientId = recipients.rows[0].user_id; // Assuming DM for now
+  if (await areUsersBlocked(senderId, recipientId)) {
+    return socket.emit('error', { message: 'Cannot send message. This user is blocked.' });
+  }
+}
+
     const algorithm = 'aes-256-cbc';
     const key = crypto.scryptSync(sender_key, 'vanish-salt', 32);
     const iv = crypto.randomBytes(16);
@@ -241,6 +271,7 @@ socket.on('send_file_message', async (data) => {
       expires_at: message.expires_at,
     };
 
+    io.to(`conversation_${conversation_id}`).emit('new_message', messageData);
     io.to(`conversation_${conversation_id}`).emit('finalize_message', messageData);
     console.log(`💬 Message ${message.id} finalized and sent to conversation ${conversation_id}`);
 
@@ -265,7 +296,9 @@ socket.on('send_file_message', async (data) => {
     if (message.sender_id === requesterId) {
       return socket.emit('error', { message: 'Cannot request decryption of your own message' });
     }
-
+if (await areUsersBlocked(requesterId, message.sender_id)) {
+    return socket.emit('error', { message: 'Cannot request decryption from a blocked user.' });
+}
     // Create decryption request, now including conversation_id
     const requestResult = await pool.query(`
       INSERT INTO decryption_requests (message_id, requester_id, sender_id, conversation_id, status)
@@ -662,7 +695,6 @@ socket.on('receiver_provide_key', async (data) => {
       console.log(`❌ User disconnected: ${socket.user.username}`);
       await handleDisconnect(socket.user.id);
     });
-
   });
 
   // Helper function to join user to their conversation rooms
@@ -685,7 +717,7 @@ socket.on('receiver_provide_key', async (data) => {
   };
 
   console.log('🚀 Revolutionary Socket.IO service initialized');
-};
+}
 
 module.exports = {
   initializeSocket
