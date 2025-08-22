@@ -181,16 +181,17 @@ useEffect(() => {
 newSocket.on('connect', () => {
     console.log('Revolutionary socket connected:', newSocket.id);
     setSocket(newSocket);
-
-    // Define the socket event handlers
+    
+    // Initialize audio immediately on socket connection
+    initializeAudio();
+    
     const setupSocketHandlers = () => {
       // Socket event handlers...
-    }; // Closing brace for setupSocketHandlers
-
-    setupSocketHandlers(); // Call the function
-}); // Add this closing brace
+    };
+    
+    setupSocketHandlers();
+});
     }
-
 // Download handler function
 const handleDownload = async (message) => {
     try {
@@ -494,41 +495,39 @@ const startDecryptionAnimation = async (messageId, decoyContent, realContent, se
         });
 
          // **THE FIX (2/2)**: This new handler fixes the real-time message update bug.
-        socket.on('new_message', (newMessageFromServer) => {
-            if (!newMessageFromServer || !newMessageFromServer.id) {
-                console.error("Received an invalid message object from server:", newMessageFromServer);
-                return;
+       socket.on('new_message', (newMessageFromServer) => {
+    if (!newMessageFromServer || !newMessageFromServer.id) {
+        console.error("Received an invalid message object from server:", newMessageFromServer);
+        return;
+    }
+
+    // Add the new message to the messages array
+    setMessages(prevMessages => {
+        const messageExists = prevMessages.some(msg => msg.id === newMessageFromServer.id);
+        if (!messageExists) {
+            return [...prevMessages, newMessageFromServer];
+        }
+        return prevMessages;
+    });
+    
+    // Always play notification sound for incoming messages (not from current user)
+    if (newMessageFromServer.sender_id !== currentUser?.id) {
+        playNotificationSound();
+    }
+    
+    // Update conversations
+    setConversations(prevConvos => {
+        const isActiveChat = selectedConversation && selectedConversation.id === newMessageFromServer.conversation_id;
+        const newConvos = prevConvos.map(convo => {
+            if (convo.id === newMessageFromServer.conversation_id) {
+                const newUnreadCount = isActiveChat ? convo.unread_count : (Number(convo.unread_count) || 0) + 1;
+                return { ...convo, last_message_at: newMessageFromServer.created_at, unread_count: newUnreadCount };
             }
-
-            // Add the new file message to the messages array
-            setMessages(prevMessages => {
-                const messageExists = prevMessages.some(msg => msg.id === newMessageFromServer.id);
-                if (!messageExists) {
-                    return [...prevMessages, newMessageFromServer];
-                }
-                return prevMessages;
-            });
-            
-            // Update the conversation list and play a notification sound if needed
-            setSelectedConversation(currentSelectedConv => {
-                const isActiveChat = currentSelectedConv && currentSelectedConv.id === newMessageFromServer.conversation_id;
-                if (!isActiveChat) {
-                    playNotificationSound();
-                }
-                setConversations(prevConvos => {
-                  const newConvos = prevConvos.map(convo => {
-                    if (convo.id === newMessageFromServer.conversation_id) {
-                      const newUnreadCount = isActiveChat ? convo.unread_count : (Number(convo.unread_count) || 0) + 1;
-                      return { ...convo, last_message_at: newMessageFromServer.created_at, unread_count: newUnreadCount };
-                    }
-                    return convo;
-                  });
-                  return newConvos.sort((a, b) => new Date(b.last_message_at) - new Date(a.last_message_at));
-                });
-                return currentSelectedConv;
-            });
+            return convo;
         });
-
+        return newConvos.sort((a, b) => new Date(b.last_message_at) - new Date(a.last_message_at));
+    });
+});
          socket.on('decryption_request', (request) => {
           toast(`🔓 Decryption request from ${request.requester_username}`, {
             duration: 5000,
@@ -707,9 +706,15 @@ useEffect(() => {
     });
 };
       
-   const handleFinalizeMessage = (finalMessageObject) => {
+  const handleFinalizeMessage = (finalMessageObject) => {
     const { conversation_id } = finalMessageObject;
-    // Set both the ID and the new message data (Decoy B) into state
+
+    // Always play notification sound for incoming messages (not from current user)
+    if (finalMessageObject.sender_id !== currentUser?.id) {
+        playNotificationSound();
+    }
+
+    // Set state for the visual animation
     setFinalizingConversationId(conversation_id);
     setFinalizingMessageData(finalMessageObject);
 };
@@ -746,14 +751,14 @@ useEffect(() => {
     };
 
     const handleNewFileMessage = (newMessage) => {
-        setMessages(prev => [...prev, newMessage]);
-        if (!selectedConversation || selectedConversation.id !== newMessage.conversation_id) {
-            playNotificationSound();
-            setConversations(prev => prev.map(c => c.id === newMessage.conversation_id ? { ...c, unread_count: (c.unread_count || 0) + 1, last_message_at: newMessage.created_at } : c).sort((a,b) => new Date(b.last_message_at) - new Date(a.last_message_at)));
-        } else {
-             setConversations(prev => prev.map(c => c.id === newMessage.conversation_id ? { ...c, last_message_at: newMessage.created_at } : c).sort((a,b) => new Date(b.last_message_at) - new Date(a.last_message_at)));
-        }
-    };
+    setMessages(prev => [...prev, newMessage]);
+    if (!selectedConversation || selectedConversation.id !== newMessage.conversation_id) {
+        playNotificationSound();
+        setConversations(prev => prev.map(c => c.id === newMessage.conversation_id ? { ...c, unread_count: (c.unread_count || 0) + 1, last_message_at: newMessage.created_at } : c).sort((a,b) => new Date(b.last_message_at) - new Date(a.last_message_at)));
+    } else {
+         setConversations(prev => prev.map(c => c.id === newMessage.conversation_id ? { ...c, last_message_at: newMessage.created_at } : c).sort((a,b) => new Date(b.last_message_at) - new Date(a.last_message_at)));
+    }
+};
 
     const handleDecryptionRequest = (request) => {
         toast(`🔓 Decryption request from ${request.requester_username}`);
